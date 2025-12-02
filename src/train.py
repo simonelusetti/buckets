@@ -11,7 +11,7 @@ import copy
 
 from dora import get_xp, hydra_main
 
-from .bucket_tree import BucketTree
+from .tree import BucketTree
 from .data import initialize_dataloaders
 from .utils import get_logger, configure_runtime, should_disable_tqdm, metrics_from_counts
 

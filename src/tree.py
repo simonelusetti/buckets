@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer
 
-from .bucket_model import BucketModel
+from .bucket import BucketModel
 
 
 def _entropy_loss(

@@ -1,155 +1,274 @@
-import os, torch, logging
-import numpy as np
+from __future__ import annotations
 
+import logging
 from pathlib import Path
-from datasets import load_from_disk
-from transformers import AutoTokenizer, AutoModel
-from dora import to_absolute_path
-from torch.utils.data import DataLoader
+from typing import Callable, Optional, Tuple
 
-from .datasets import (
-    normalize_dataset_config,
-    dataset_cache_filename,
-    resolve_dataset,
-    encode_examples,
-    NER_LABEL_NAMES,
-)
+import numpy as np
+import torch
+from datasets import Dataset, load_dataset, load_from_disk
+from dora import to_absolute_path
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
+from transformers import AutoModel, AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-def _freeze_encoder(encoder):
+DATASETS_WITH_CONFIG = {
+    "wikiann": "en",
+    "cnn": "3.0.0",
+    "cnn_highlights": "3.0.0",
+}
+
+NER_LABEL_NAMES = {
+    "wikiann": ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"],
+    "conll2003": ["O", "B-MISC", "I-MISC", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"],
+}
+
+
+def sanitize_fragment(fragment: str) -> str:
+    return fragment.replace("/", "-")
+
+
+def normalize_dataset_config(name: str, dataset_config: Optional[str]) -> Optional[str]:
+    default = DATASETS_WITH_CONFIG.get(name)
+    if default is None:
+        return None
+    return dataset_config or default
+
+
+def dataset_cache_filename(
+    name: str,
+    split: str,
+    subset,
+    *,
+    cnn_field: Optional[str] = None,
+    dataset_config: Optional[str] = None,
+) -> str:
+    parts = [name]
+    if dataset_config:
+        parts.append(sanitize_fragment(dataset_config))
+    if cnn_field:
+        parts.append(cnn_field)
+    parts.append(split)
+    if subset is not None and subset != 1.0:
+        parts.append(str(subset))
+    return "_".join(parts) + ".pt"
+
+
+def _freeze_encoder(encoder: AutoModel) -> AutoModel:
     encoder.eval()
-    for p in encoder.parameters():
-        p.requires_grad = False
+    for param in encoder.parameters():
+        param.requires_grad = False
     return encoder
 
+
+def _dataset_cache_paths(
+    name: str,
+    split: str,
+    subset,
+    *,
+    cnn_field: Optional[str],
+    dataset_config: Optional[str],
+) -> Tuple[Path, Optional[Path]]:
+    primary = Path(
+        to_absolute_path(
+            f"./data/{dataset_cache_filename(name, split, subset, cnn_field=cnn_field, dataset_config=dataset_config)}"
+        )
+    )
+    fallback = None
+    if subset not in (None, 1.0):
+        fallback = Path(
+            to_absolute_path(
+                f"./data/{dataset_cache_filename(name, split, None, cnn_field=cnn_field, dataset_config=dataset_config)}"
+            )
+        )
+    return primary, fallback
+
+
+def _apply_subset_and_shuffle(ds: Dataset, subset, *, shuffle: bool, log: bool) -> Dataset:
+    if shuffle:
+        ds = ds.shuffle(seed=42)
+    if subset is None or subset == 1.0:
+        return ds
+
+    target_subset = int(len(ds) * subset) if subset <= 1.0 else int(subset)
+    if target_subset <= 0:
+        raise ValueError(f"Requested subset {subset} results in 0 examples.")
+    ds = ds.select(range(target_subset))
+    if log:
+        logger.info("Materialised subset of %s examples.", target_subset)
+    return ds
+
+
+def _resolve_dataset(
+    name: str,
+    split: str,
+    dataset_config: Optional[str],
+    raw_dataset_root: Optional[str],
+    cnn_field: Optional[str],
+) -> Tuple[Dataset, Callable]:
+    raw_split_path = None
+    if raw_dataset_root is not None:
+        raw_split_path = Path(raw_dataset_root) / split
+        if not raw_split_path.exists():
+            raise FileNotFoundError(f"Raw dataset split not found at {raw_split_path}")
+
+    if name in {"cnn_highlights", "cnn"}:
+        config_name = dataset_config or DATASETS_WITH_CONFIG["cnn"]
+        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("cnn_dailymail", config_name, split=split)
+        target_field = cnn_field or "highlights"
+        text_fn = lambda x: x[target_field]
+    elif name == "wikiann":
+        config_name = dataset_config or DATASETS_WITH_CONFIG["wikiann"]
+        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("wikiann", config_name, split=split)
+        text_fn = lambda x: x["tokens"]
+    elif name == "conll2003":
+        ds = load_from_disk(str(raw_split_path)) if raw_split_path is not None else load_dataset("conll2003", revision="refs/convert/parquet", split=split)
+        text_fn = lambda x: x["tokens"]
+    else:
+        raise ValueError(f"Unknown dataset name: {name}")
+
+    return ds, text_fn
+
+
+def encode_examples(
+    ds: Dataset,
+    tok: AutoTokenizer,
+    encoder: AutoModel,
+    text_fn: Callable,
+    max_length: int,
+) -> Dataset:
+    def _tokenize_and_encode(example):
+        text = text_fn(example)
+        split_into_words = isinstance(text, (list, tuple))
+        enc = tok(
+            text,
+            truncation=True,
+            max_length=max_length,
+            is_split_into_words=split_into_words,
+        )
+
+        device = next(encoder.parameters()).device
+        inputs = {
+            "input_ids": torch.tensor(enc["input_ids"], device=device).unsqueeze(0),
+            "attention_mask": torch.tensor(enc["attention_mask"], device=device).unsqueeze(0),
+        }
+        with torch.no_grad():
+            out = encoder(**inputs, output_attentions=False, return_dict=True)
+
+        out_dict = {
+            "input_ids": np.asarray(enc["input_ids"], dtype=np.int64),
+            "attention_mask": np.asarray(enc["attention_mask"], dtype=np.int64),
+            "embeddings": out.last_hidden_state.squeeze(0).detach().cpu().to(torch.float32).numpy(),
+        }
+
+        if "ner_tags" in example and split_into_words:
+            word_ids = enc.word_ids()
+            ner_tags = example["ner_tags"]
+            aligned = []
+            for word_id in word_ids:
+                if word_id is None:
+                    aligned.append(0)
+                else:
+                    aligned.append(ner_tags[word_id])
+            out_dict["ner_tags"] = np.asarray(aligned, dtype=np.int64)
+            out_dict["tokens"] = example.get("tokens", [])
+        return out_dict
+
+    return ds.map(_tokenize_and_encode, remove_columns=ds.column_names, batched=False)
+
+
 def build_dataset(
-    name,
-    split,
-    tokenizer_name,
-    max_length,
+    name: str,
+    split: str,
+    tokenizer_name: str,
+    max_length: int,
     subset=None,
-    shuffle=False,
-    cnn_field=None,
-    dataset_config=None,
-    raw_dataset_root=None,
-):
-    """
-    Generic dataset builder for CNN, WikiANN, CoNLL, WNUT, OntoNotes, BC2GM, and FrameNet.
-    """
+    shuffle: bool = False,
+    cnn_field: Optional[str] = None,
+    dataset_config: Optional[str] = None,
+    raw_dataset_root: Optional[str] = None,
+    log: bool = True,
+) -> Tuple[Dataset, AutoTokenizer]:
     dataset_config = normalize_dataset_config(name, dataset_config)
-    ds, text_fn, keep_labels = resolve_dataset(
+    ds, text_fn = _resolve_dataset(
         name=name,
         split=split,
         dataset_config=dataset_config,
         raw_dataset_root=raw_dataset_root,
         cnn_field=cnn_field,
-        logger=logger,
     )
-    
-    if shuffle:
-        ds = ds.shuffle(seed=42)
-
-    if subset is not None:
-        if subset <= 1.0:
-            subset = int(len(ds) * subset)
-        ds = ds.select(range(subset))
+    ds = _apply_subset_and_shuffle(ds, subset, shuffle=shuffle, log=log)
 
     tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     encoder = _freeze_encoder(AutoModel.from_pretrained(tokenizer_name))
-    ds = encode_examples(ds, tok, encoder, text_fn, max_length, keep_labels)
+    ds = encode_examples(ds, tok, encoder, text_fn, max_length)
     return ds, tok
 
-def initialize_dataloaders(cfg, log=True):
-    train_cfg = cfg.data.train
-    eval_cfg = cfg.data.eval
-    dev_cfg = cfg.data.dev
 
-    train_cnn_field = train_cfg.cnn_field if hasattr(train_cfg, "cnn_field") else None
-    train_ds, _ = get_dataset(
-        name=train_cfg.dataset,
-        subset=train_cfg.subset,
-        rebuild=cfg.data.rebuild_ds,
-        shuffle=train_cfg.shuffle,
-        dataset_config=train_cfg.config,
-        cnn_field=train_cnn_field,
+def get_dataset(
+    tokenizer_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    name: str = "cnn",
+    split: str = "train",
+    dataset_config: Optional[str] = None,
+    cnn_field: Optional[str] = None,
+    subset=None,
+    rebuild: bool = False,
+    shuffle: bool = False,
+    log: bool = True,
+    max_length: int = 512,
+    raw_dataset_root: Optional[str] = None,
+) -> Tuple[Dataset, AutoTokenizer]:
+    dataset_config = normalize_dataset_config(name, dataset_config)
+    cache_path, fallback_path = _dataset_cache_paths(
+        name,
+        split,
+        subset,
+        cnn_field=cnn_field,
+        dataset_config=dataset_config,
+    )
+    if cache_path.exists() and not rebuild:
+        if log:
+            logger.info("Loading cached dataset from %s", cache_path)
+        ds = load_from_disk(cache_path)
+        tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        if shuffle and subset not in (None, 1.0):
+            ds = _apply_subset_and_shuffle(ds, subset, shuffle=shuffle, log=log)
+        return ds, tok
+
+    if fallback_path and fallback_path.exists() and not rebuild:
+        if log:
+            logger.info(
+                "Subset cache %s not found; using full cache %s and selecting subset in-memory.",
+                cache_path,
+                fallback_path,
+            )
+        ds = load_from_disk(fallback_path)
+        ds = _apply_subset_and_shuffle(ds, subset, shuffle=shuffle, log=log)
+        tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        return ds, tok
+
+    if log:
+        logger.info("Building dataset for %s/%s (subset=%s)", name, split, subset)
+    ds, tok = build_dataset(
+        name=name,
+        split=split,
+        tokenizer_name=tokenizer_name,
+        max_length=max_length,
+        subset=subset,
+        shuffle=shuffle,
+        cnn_field=cnn_field,
+        dataset_config=dataset_config,
+        raw_dataset_root=raw_dataset_root,
         log=log,
     )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    ds.save_to_disk(cache_path)
+    return ds, tok
 
-    eval_split = eval_cfg.split if hasattr(eval_cfg, "split") else "validation"
-    eval_cnn_field = eval_cfg.cnn_field if hasattr(eval_cfg, "cnn_field") else None
-    eval_ds, _ = get_dataset(
-        split=eval_split,
-        name=eval_cfg.dataset,
-        subset=eval_cfg.subset,
-        rebuild=cfg.data.rebuild_ds,
-        shuffle=bool(eval_cfg.shuffle),
-        dataset_config=eval_cfg.config,
-        cnn_field=eval_cnn_field,
-        log=log,
-    )
-
-    dev_dl = None
-    if dev_cfg and dev_cfg.dataset:
-        dev_cnn_field = dev_cfg.cnn_field if hasattr(dev_cfg, "cnn_field") else None
-        dev_split = dev_cfg.split if hasattr(dev_cfg, "split") else "test"
-        dev_ds, _ = get_dataset(
-            split=dev_split,
-            name=dev_cfg.dataset,
-            subset=dev_cfg.subset,
-            rebuild=cfg.data.rebuild_ds,
-            shuffle=bool(dev_cfg.shuffle),
-            dataset_config=dev_cfg.config,
-            cnn_field=dev_cnn_field,
-            log=log,
-        )
-        dev_dl = DataLoader(
-            dev_ds,
-            batch_size=dev_cfg.batch_size,
-            collate_fn=collate,
-            num_workers=dev_cfg.num_workers,
-            pin_memory=(cfg.runtime.device == "cuda"),
-            persistent_workers=(dev_cfg.num_workers > 0),
-            shuffle=bool(dev_cfg.shuffle),
-        )
-
-    train_dl = DataLoader(
-        train_ds,
-        batch_size=train_cfg.batch_size,
-        collate_fn=collate,
-        num_workers=train_cfg.num_workers,
-        pin_memory=(cfg.runtime.device == "cuda"),
-        persistent_workers=(train_cfg.num_workers > 0),
-        shuffle=train_cfg.shuffle,
-    )
-    eval_dl = DataLoader(
-        eval_ds,
-        batch_size=eval_cfg.batch_size,
-        collate_fn=collate,
-        num_workers=eval_cfg.num_workers,
-        pin_memory=(cfg.runtime.device == "cuda"),
-        persistent_workers=(eval_cfg.num_workers > 0),
-        shuffle=bool(eval_cfg.shuffle),
-    )
-
-    train_label_names = NER_LABEL_NAMES.get(cfg.data.train.dataset)
-    if train_label_names:
-        setattr(train_dl, "label_names", train_label_names)
-    eval_label_names = NER_LABEL_NAMES.get(eval_cfg.dataset)
-    if eval_label_names:
-        setattr(eval_dl, "label_names", eval_label_names)
-    if dev_dl is not None:
-        dev_label_names = NER_LABEL_NAMES.get(dev_cfg.dataset)
-        if dev_label_names:
-            setattr(dev_dl, "label_names", dev_label_names)
-            
-    return train_dl, eval_dl, dev_dl
-
-
-from torch.nn.utils.rnn import pad_sequence
 
 def collate(batch):
-    # assume batch is a list of dicts
     def _as_tensor(value, dtype):
         if isinstance(value, torch.Tensor):
             return value.to(dtype=dtype)
@@ -157,105 +276,89 @@ def collate(batch):
             return torch.from_numpy(value).to(dtype=dtype)
         return torch.tensor(value, dtype=dtype)
 
-    input_ids = [_as_tensor(x["input_ids"], torch.long) for x in batch]
-    attention_masks = [_as_tensor(x["attention_mask"], torch.long) for x in batch]
+    input_ids = pad_sequence(
+        tuple(_as_tensor(item["input_ids"], torch.long) for item in batch),
+        batch_first=True,
+        padding_value=0,
+    )
+    attention_masks = pad_sequence(
+        tuple(_as_tensor(item["attention_mask"], torch.long) for item in batch),
+        batch_first=True,
+        padding_value=0,
+    )
 
     has_ner = "ner_tags" in batch[0]
     if has_ner:
-        ner_tags = [_as_tensor(x["ner_tags"], torch.long) for x in batch]
-
-    # pad to longest sequence in batch
-    input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
-    attention_masks = pad_sequence(attention_masks, batch_first=True, padding_value=0)
-    if has_ner:
-        ner_tags = pad_sequence(ner_tags, batch_first=True, padding_value=-100)  # -100 is common ignore_index
+        ner_tags = pad_sequence(
+            tuple(_as_tensor(item["ner_tags"], torch.long) for item in batch),
+            batch_first=True,
+            padding_value=-100,
+        )
 
     batch_out = {
         "input_ids": input_ids,
         "attention_mask": attention_masks,
     }
-
     if has_ner:
         batch_out["ner_tags"] = ner_tags
 
-    # add precomputed embeddings if your dataset already has them
     if "embeddings" in batch[0]:
-        embeddings = [_as_tensor(x["embeddings"], torch.float) for x in batch]
-        embeddings = pad_sequence(embeddings, batch_first=True, padding_value=0.0)
+        embeddings = pad_sequence(
+            tuple(_as_tensor(item["embeddings"], torch.float) for item in batch),
+            batch_first=True,
+            padding_value=0.0,
+        )
         batch_out["embeddings"] = embeddings
-
     return batch_out
 
 
-def get_dataset(tokenizer_name="sentence-transformers/all-MiniLM-L6-v2",
-                name="cnn", split="train", dataset_config=None,
-                cnn_field=None, subset=None, rebuild=False, shuffle=False, 
-                log=True):
-    dataset_config = normalize_dataset_config(name, dataset_config)
+def initialize_dataloaders(cfg, log: bool = True):
+    train_cfg = cfg.data.train
+    eval_cfg = cfg.data.eval
+    dev_cfg = cfg.data.dev
 
-    filename = dataset_cache_filename(
-        name,
-        split,
-        subset,
-        cnn_field=cnn_field,
-        dataset_config=dataset_config,
-    )
-    path = Path(to_absolute_path(f"./data/{filename}"))
-    apply_subset_after_load = False
-    tok = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+    tokenizer_name = cfg.bucket_model.sbert_model
 
-    if rebuild:
-        raise RuntimeError(
-            "Dataset rebuilds are handled by ../tools/datasets/build_dataset.py. Run it before launching training."
+    def _build_loader(split_cfg, split_override: Optional[str] = None):
+        split = split_override or split_cfg.split
+        cnn_field = split_cfg.cnn_field if hasattr(split_cfg, "cnn_field") else None
+        ds, _ = get_dataset(
+            tokenizer_name=tokenizer_name,
+            name=split_cfg.dataset,
+            split=split,
+            subset=split_cfg.subset,
+            dataset_config=split_cfg.config,
+            cnn_field=cnn_field,
+            rebuild=cfg.data.rebuild_ds,
+            shuffle=split_cfg.shuffle,
+            log=log,
+            raw_dataset_root=None,
+        )
+        return DataLoader(
+            ds,
+            batch_size=split_cfg.batch_size,
+            collate_fn=collate,
+            num_workers=split_cfg.num_workers,
+            pin_memory=(cfg.runtime.device == "cuda"),
+            persistent_workers=(split_cfg.num_workers > 0),
+            shuffle=split_cfg.shuffle,
         )
 
-    if not os.path.exists(path):
-        if subset is not None and subset != 1.0:
-            fallback_filename = dataset_cache_filename(
-                name,
-                split,
-                None,
-                cnn_field=cnn_field,
-                dataset_config=dataset_config,
-            )
-            fallback_path = Path(to_absolute_path(f"./data/{fallback_filename}"))
-            if fallback_path.exists():
-                if log:
-                    logger.warning(
-                        "Subset cache %s not found; using full cache %s and selecting a subset in-memory.",
-                        path,
-                        fallback_path,
-                    )
-                path = fallback_path
-                apply_subset_after_load = True
-            else:
-                raise FileNotFoundError(
-                    f"Dataset cache {path} not found. "
-                    f"Run `../tools/datasets/build_dataset.py --dataset {name} --splits {split}` to materialise it."
-                )
-        else:
-            raise FileNotFoundError(
-                f"Dataset cache {path} not found. Run `../tools/datasets/build_dataset.py --dataset {name} --splits {split}` to materialise it."
-            )
+    def _attach_label_names(dataloader, dataset_name: str):
+        label_names = NER_LABEL_NAMES.get(dataset_name)
+        if label_names:
+            setattr(dataloader, "label_names", label_names)
 
-    if log:
-        logger.info(f"Loading cached dataset from {path}")
-    try:
-        ds = load_from_disk(path)
-    except (FileNotFoundError, ValueError) as err:
-        raise RuntimeError(
-            "Dataset cache is unreadable. Rebuild it with ../tools/datasets/build_dataset.py."
-        ) from err
+    train_dl = _build_loader(train_cfg, "train")
+    eval_dl = _build_loader(eval_cfg, eval_cfg.split)
 
-    if apply_subset_after_load:
-        target_subset = subset
-        if target_subset <= 1.0:
-            target_subset = int(len(ds) * target_subset)
-        ds = ds.select(range(target_subset))
-        if log:
-            logger.info("Materialised subset of %s examples from %s in-memory.", target_subset, path)
+    dev_dl = None
+    if dev_cfg and dev_cfg.dataset:
+        dev_dl = _build_loader(dev_cfg, dev_cfg.split)
 
-    if shuffle:
-        ds = ds.shuffle(seed=42)
+    _attach_label_names(train_dl, train_cfg.dataset)
+    _attach_label_names(eval_dl, eval_cfg.dataset)
+    if dev_dl is not None:
+        _attach_label_names(dev_dl, dev_cfg.dataset)
 
-    return ds, tok
+    return train_dl, eval_dl, dev_dl

@@ -21,17 +21,19 @@ entity_eval:
   run_after_epoch: True
 
 data:
-  rebuild_ds: False
+  rebuild: False
   train:
     dataset: "wikiann"
-    config: "en"
+    config: 
+      lan: "en"
     batch_size: 16
     num_workers: 0
     subset: 1.0
     shuffle: True
   eval:
     dataset: "wikiann"
-    config: "en"
+    config: 
+      lan: "en"
     split: "validation"
     batch_size: 16
     num_workers: 0
@@ -39,7 +41,8 @@ data:
     shuffle: False
   dev:
     dataset: "wikiann"
-    config: "en"
+    config:
+      lan: "en"
     split: "test"
     batch_size: 16
     num_workers: 0
