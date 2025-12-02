@@ -5,290 +5,239 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 from prettytable import PrettyTable
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import copy
 
 from dora import get_xp, hydra_main
 
-from .sae import SparseAutoencoder
+from .bucket_tree import BucketTree
 from .data import initialize_dataloaders
-from .utils import (
-    get_logger,
-    configure_runtime,
-    should_disable_tqdm,
-    metrics_from_counts,
-)
+from .utils import get_logger, configure_runtime, should_disable_tqdm, metrics_from_counts
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-def _flatten_tokens_with_labels(batch,device):
+
+def _prepare_batch(batch, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     embeddings = batch["embeddings"].to(device, non_blocking=True)
-    mask = batch["attention_mask"].to(device, non_blocking=True).bool()
-    
-    if not mask.any():
-        return None
-    if "ner_tags" not in batch:
-        return embeddings[mask], None
-    
-    labels_raw = batch["ner_tags"].to(device, non_blocking=True)
-    labels_flat = labels_raw[mask]
-    entities = (labels_flat > 0).to(torch.bool)  # treat any non-zero tag as entity
+    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+    input_ids = batch["input_ids"].to(device, non_blocking=True)
+    if "ner_tags" in batch:
+        return embeddings, attention_mask, input_ids, batch["ner_tags"].to(device, non_blocking=True)
+    return embeddings, attention_mask, input_ids, None
 
-    tokens = embeddings[mask]
-    return tokens, entities
 
-class SparseAETrainer:
-    def __init__(self, cfg, train_dl, eval_dl, dev_dl, logger, xp, device) -> None:
+class BucketTrainer:
+    def __init__(self, cfg, train_dl, eval_dl, logger, xp, device) -> None:
         self.cfg = cfg
         self.device = device
         self.logger = logger
         self.xp = xp
-
         self.train_dl = train_dl
         self.eval_dl = eval_dl
-        self.dev_dl = dev_dl
 
-        self.grad_clip = float(cfg.sae.grad_clip)
-        self.log_interval = int(cfg.train.log_interval)
+        self.grad_clip = cfg.bucket_model.grad_clip
         self.checkpoint_path = cfg.train.checkpoint
-        self.disable_progress = should_disable_tqdm() or cfg.train.grid_mode
+        self.disable_progress = should_disable_tqdm()
 
-        self.model: Optional[SparseAutoencoder] = None
-        self.optimizer: Optional[torch.optim.Optimizer] = None
-        self.global_step = 0
-
-    def _init_model(self, tokens: torch.Tensor):
-        if self.model is not None:
-            return
-        sae_cfg = self.cfg.sae
-        d_model = tokens.size(-1)
-        self.model = SparseAutoencoder(
-            d_model=d_model,
-            expansion=sae_cfg.expansion,
-            alpha=sae_cfg.alpha,
-        ).to(self.device)
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=float(sae_cfg.lr),
-            weight_decay=float(sae_cfg.weight_decay),
-        )
-        if not self.cfg.train.grid_mode:
-            self.logger.info(
-                "Initialized SAE: d_model=%d d_hidden=%d expansion=%.2f alpha=%.6f",
-                self.model.d_model,
-                self.model.d_hidden,
-                self.model.expansion,
-                self.model.alpha,
-            )
-
-    def _metrics_table(self, metrics: Dict[str, float]) -> PrettyTable:
-        table = PrettyTable()
-        table.field_names = list(metrics.keys())
-        row = [f"{v:.6f}" if isinstance(v, float) else v for v in metrics.values()]
-        table.add_row(row)
-        return table
-
-    def _train_epoch(self, epoch_idx: int) -> Dict[str, float]:
-        if self.model is not None:
-            self.model.train()
-        totals = {"loss": 0.0, "mse": 0.0, "l1": 0.0}
-        token_count = 0
-
-        iterator = tqdm(self.train_dl, desc=f"SAE Train {epoch_idx + 1}", disable=self.disable_progress)
-        for batch in iterator:
-            tokens, _ = _flatten_tokens_with_labels(batch, self.device)
-            if tokens is None:
-                continue
-            self._init_model(tokens)
-            self.model.train()
-
-            self.optimizer.zero_grad(set_to_none=True)
-            output = self.model(tokens)
-            loss = output["loss"]
-            loss.backward()
-
-            if self.grad_clip > 0.0:
-                clip_grad_norm_(self.model.parameters(), self.grad_clip)
-
-            self.optimizer.step()
-            self.model.normalize_dictionary()
-
-            num_tokens = tokens.size(0)
-            token_count += num_tokens
-            totals["loss"] += loss.item() * num_tokens
-            totals["mse"] += float(output["mse"].detach()) * num_tokens
-            totals["l1"] += float(output["l1"].detach())
-
-            self.global_step += 1
-
-        if token_count == 0:
-            raise RuntimeError("No tokens were processed in this epoch; check that the dataset has ner_tags and non-empty batches.")
-
-        return totals["loss"] / token_count, totals["mse"] / token_count, totals["l1"] / token_count
-    
-    def _save_checkpoint(self):
-        if self.model is None:
-            raise RuntimeError("Cannot save checkpoint without a model.")
-        state = {
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict() if self.optimizer is not None else None,
-            "meta": {
-                "d_model": self.model.d_model,
-                "d_hidden": self.model.d_hidden,
-                "expansion": self.model.expansion,
-                "alpha": self.model.alpha,
-            },
+        self.loss_weights = {
+            "entropy_weight": cfg.bucket_model.entropy_weight,
+            "balance_weight": cfg.bucket_model.balance_weight,
+            "prototype_pull_weight": cfg.bucket_model.prototype_pull_weight,
+            "prototype_repulsion_weight": cfg.bucket_model.prototype_repulsion_weight,
         }
+
+        d_model = torch.tensor(self.train_dl.dataset[0]["embeddings"]).shape[-1]
+        bm_cfg = copy.deepcopy(self.cfg.bucket_model)
+        bm_cfg.d_model = d_model
+        self.tree = BucketTree(
+            bucket_cfg=bm_cfg,
+            loss_weights=self.loss_weights,
+            device=self.device,
+            sbert_name=self.cfg.bucket_model.sbert_model,
+        )
+
+    def _save_checkpoint(self):
+        state = {"nodes": [], "meta": {"tree_depth": self.tree.depth}}
+        for node in self.tree.iter_nodes():
+            state["nodes"].append(
+                {
+                    "path": node.path,
+                    "model": node.model.state_dict(),
+                    "optimizer": node.optimizer.state_dict(),
+                }
+            )
         torch.save(state, self.checkpoint_path, _use_new_zipfile_serialization=False)
-        if not self.cfg.train.grid_mode:
-            self.logger.info("Saved SAE checkpoint to %s", os.path.abspath(self.checkpoint_path))
+        self.logger.info("Saved bucket tree checkpoint to %s", os.path.abspath(self.checkpoint_path))
 
     def _load_checkpoint(self):
         path = self.checkpoint_path
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Checkpoint not found at {path}")
         state = torch.load(path, map_location=self.device)
-        meta = state.get("meta", {})
-        d_model = int(meta.get("d_model"))
-        expansion = float(meta.get("expansion", self.cfg.sae.expansion))
-        alpha = float(meta.get("alpha", self.cfg.sae.alpha))
-        self.model = SparseAutoencoder(d_model=d_model, expansion=expansion, alpha=alpha).to(self.device)
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=float(self.cfg.sae.lr),
-            weight_decay=float(self.cfg.sae.weight_decay),
-        )
-        self.model.load_state_dict(state["model"], strict=True)
-        if "optimizer" in state and state["optimizer"] is not None:
+        nodes_state = state.get("nodes", [])
+        path_map = {node.path: node for node in self.tree.iter_nodes()}
+        for entry in nodes_state:
+            path = tuple(entry.get("path", ()))
+            node = path_map.get(path)
+            if node is None:
+                continue
+            node.model.load_state_dict(entry["model"], strict=False)
             try:
-                self.optimizer.load_state_dict(state["optimizer"])
+                node.optimizer.load_state_dict(entry["optimizer"])
             except Exception:
                 pass
-        if not self.cfg.train.grid_mode:
-            self.logger.info(
-                "Loaded SAE checkpoint from %s (d_model=%d d_hidden=%d expansion=%.2f alpha=%.6f)",
-                path,
-                self.model.d_model,
-                self.model.d_hidden,
-            self.model.expansion,
-            self.model.alpha,
+        self.logger.info("Loaded bucket tree checkpoint from %s", path)
+       
+    def _run_batch(self, embeddings: torch.Tensor, attention_mask: torch.Tensor, input_ids: torch.Tensor, *, train: bool) -> Dict[str, torch.Tensor]:
+        # Zero all node grads
+        for node in self.tree.iter_nodes():
+            node.optimizer.zero_grad(set_to_none=True)
+
+        leaves = self.tree.train_forward(embeddings, attention_mask, input_ids)
+        if not leaves:
+            return {}, torch.tensor(0.0, device=self.device)
+        loss = sum(entry["losses"]["loss"] for entry in leaves)
+
+        if train:
+            loss.backward()
+            if self.grad_clip > 0.0:
+                for node in self.tree.iter_nodes():
+                    clip_grad_norm_(node.model.parameters(), self.grad_clip)
+            for node in self.tree.iter_nodes():
+                node.optimizer.step()
+        # Aggregate metrics across leaves
+        metrics = {}
+        num = len(leaves)
+        for entry in leaves:
+            for k, v in entry["losses"].items():
+                val = v if isinstance(v, torch.Tensor) else torch.tensor(v, device=self.device, dtype=torch.float32)
+                metrics[k] = metrics.get(k, 0.0) + float(val.detach())
+        for k in metrics:
+            metrics[k] /= num
+        return metrics, loss
+
+    def _train_epoch(self, epoch_idx: int) -> Dict[str, float]:
+        totals = {
+            "loss": 0.0,
+            "recon": 0.0,
+            "entropy": 0.0,
+            "balance": 0.0,
+            "pull": 0.0,
+            "repulsion": 0.0,
+        }
+        example_count = 0
+
+        iterator = tqdm(self.train_dl, desc=f"Training {epoch_idx + 1}", disable=self.disable_progress)
+        for batch in iterator:
+            embeddings, attention_mask, input_ids, _ = _prepare_batch(batch, self.device)
+            metrics, loss = self._run_batch(embeddings, attention_mask, input_ids, train=True)
+
+            batch_size = embeddings.size(0)
+            example_count += batch_size
+            totals["loss"] += loss * batch_size
+            totals["recon"] += metrics["recon"] * batch_size
+            totals["entropy"] += metrics["entropy"] * batch_size
+            totals["balance"] += metrics["balance"] * batch_size
+            totals["pull"] += metrics["pull"] * batch_size
+            totals["repulsion"] += metrics["repulsion"] * batch_size
+        if example_count == 0:
+            raise RuntimeError("No training examples were processed.")
+
+        return {k: v / example_count for k, v in totals.items()}
+
+    @torch.no_grad()
+    def _evaluate(self) -> Dict[str, float]:
+        counts = {}
+        iterator = tqdm(self.eval_dl, desc="Bucket Eval (entity)", disable=self.disable_progress)
+        for batch in iterator:
+            embeddings, attention_mask, input_ids, labels = _prepare_batch(batch, self.device)
+            if labels is None:
+                continue
+            gold = (labels > 0) & attention_mask.bool()
+            results = self.tree.eval_forward(embeddings, attention_mask, input_ids)
+            for path, gates, mask in results:
+                mask_bool = mask.bool()
+                for k in range(gates.size(-1)):
+                    pred = gates[:, :, k] & mask_bool
+                    key = f"{'root' if not path else '_'.join(map(str, path))}:{k}"
+                    tp, fp, fn = counts.get(key, (0.0, 0.0, 0.0))
+                    tp += (pred & gold).sum().item()
+                    fp += (pred & ~gold).sum().item()
+                    fn += ((~pred) & gold).sum().item()
+                    counts[key] = (tp, fp, fn)
+
+        metrics = []
+        for key, (tp, fp, fn) in counts.items():
+            f1, p, r = metrics_from_counts(tp, fp, fn)
+            metrics.append((key, f1, p, r, tp, fp, fn))
+        if not metrics:
+            return -1, 0.0, 0.0, 0.0, "No eval data"
+
+        metrics_sorted = sorted(metrics, key=lambda x: x[1], reverse=True)
+        best_key, best_f1, best_p, best_r, _, _, _ = metrics_sorted[0]
+
+        table = PrettyTable()
+        table.field_names = ["bucket", "f1", "precision", "recall", "tp", "fp", "fn"]
+        for key, f1, p, r, tp, fp, fn in metrics_sorted:
+            table.add_row([key, f"{f1:.4f}", f"{p:.4f}", f"{r:.4f}", int(tp), int(fp), int(fn)])
+
+        return best_key, best_f1, best_p, best_r, table.get_string()
+
+    def evaluate(self, header) -> None:
+        best_idx, best_f1, best_p, best_r, table_str = self._evaluate()
+        self.logger.info(header+"\n"+table_str)
+        self.logger.info(
+            "Best bucket=%s f1=%.4f precision=%.4f recall=%.4f",
+            best_idx,
+            best_f1,
+            best_p,
+            best_r,
         )
 
-    def _select_entity_dimension(self, loader) -> Optional[int]:
-        if self.model is None:
-            raise RuntimeError("Model is not initialized.")
-        self.model.eval()
-        sum_ent = torch.zeros(self.model.d_hidden, device=self.device)
-        sum_non = torch.zeros(self.model.d_hidden, device=self.device)
-        count_ent = 0
-        count_non = 0
-        with torch.no_grad():
-            iterator = tqdm(loader, desc="Finding entity dimension", disable=self.disable_progress)
-            for batch in iterator:
-                flattened = _flatten_tokens_with_labels(batch, self.device)
-                if flattened is None:
-                    continue
-                tokens, labels = flattened
-                out = self.model(tokens)
-                codes = out["codes"]
-                ent_mask = labels
-                non_mask = ~labels
-                if ent_mask.any():
-                    sum_ent += codes[ent_mask].sum(dim=0)
-                    count_ent += int(ent_mask.sum().item())
-                if non_mask.any():
-                    sum_non += codes[non_mask].sum(dim=0)
-                    count_non += int(non_mask.sum().item())
-        if count_ent == 0 or count_non == 0:
-            self.logger.warning("Unable to select entity dimension (missing entities or non-entities).")
-            return None
-        mean_ent = sum_ent / max(1, count_ent)
-        mean_non = sum_non / max(1, count_non)
-        diff = mean_ent - mean_non
-        best_dim = int(torch.argmax(diff).item())
-        if not self.cfg.train.grid_mode:
-            self.logger.info(
-                "Selected entity dimension %d (mean_ent=%.6f mean_non=%.6f diff=%.6f)",
-                best_dim,
-                mean_ent[best_dim].item(),
-                mean_non[best_dim].item(),
-                diff[best_dim].item(),
-            )
-        return best_dim
-
-    def evaluate(self) -> Dict[str, float]:
-        best_dim = self._select_entity_dimension(self.eval_dl)
-        if best_dim is None:
-            return {"dimension": -1, "f1": 0.0, "precision": 0.0, "recall": 0.0}
-        thresh = float(self.cfg.entity_eval.threshold)
-        self.model.eval()
-        tp = fp = fn = 0
-        with torch.no_grad():
-            iterator = tqdm(self.dev_dl, desc="Entity dim eval", disable=self.disable_progress)
-            for batch in iterator:
-                flattened = _flatten_tokens_with_labels(batch, self.device)
-                if flattened is None:
-                    continue
-                tokens, labels = flattened
-                codes = self.model(tokens)["codes"]
-                preds = (codes[:, best_dim] > thresh)
-                gold = labels
-                tp += int((preds & gold).sum().item())
-                fp += int((preds & ~gold).sum().item())
-                fn += int((~preds & gold).sum().item())
-        f1, precision, recall = metrics_from_counts(tp, fp, fn)
-        return best_dim, f1 , precision, recall
-
-    def train(self):
-        best_f1 = 0.0
-        best_dim = -1
-        for epoch in range(int(self.cfg.train.epochs)):
-            loss, mse, l1 = self._train_epoch(epoch)
-            if not self.cfg.train.grid_mode:
-                self.logger.info(
-                    "Epoch %d/%d train metrics:\n%s",
-                    epoch + 1,
-                    self.cfg.train.epochs,
-                    self._metrics_table({"loss": loss, "mse": mse, "l1": l1}),
-                )
-            dim, f1, precision, recall = self.evaluate()
-            if not self.cfg.train.grid_mode:
-                self.logger.info("Epoch %d dimension=%s", epoch + 1, dim)
-                self.logger.info("Epoch %d metrics:\n%s", epoch + 1, self._metrics_table({"f1": f1, "precision": precision, "recall": recall}))
-            if f1 > best_f1:
-                best_f1 = f1
-                best_dim = dim
-                self.xp.link.push_metrics({"best_f1": best_f1, "best_dimension": best_dim, "best_epoch": epoch + 1})
-                self.logger.info("Epoch %d metrics:\n%s", epoch + 1, self._metrics_table({"f1": f1, "precision": precision, "recall": recall}))
+    def train_stage(self, stage: int, epochs: int):
+        for epoch in tqdm(range(epochs), desc=f"Stage {stage} Training", disable=self.disable_progress):
+            train_metrics = self._train_epoch(epoch)
+            table = PrettyTable()
+            table.field_names = ["loss", "recon", "entropy", "balance", "pull", "repulsion"]
+            table.add_row([f"{train_metrics[k]:.6f}" for k in table.field_names])
+            self.logger.info("Epoch %d/%d train:\n%s", epoch + 1, epochs, table)
+            if self.eval_dl is not None and self.cfg.train.eval_epoch:
+                self.evaluate(f"Stage {stage} Epoch {epoch + 1} Evaluation:")
             self._save_checkpoint()
 
+    def train(self):
+        for stage_idx, epochs in enumerate(self.cfg.train.epochs):
+            self.train_stage(stage_idx + 1, epochs)
+            self.evaluate(f"Stage {stage_idx + 1}:")
 
-@hydra_main(config_path="conf", config_name="default", version_base="1.1")
+
+@hydra_main(config_path="conf", config_name="bucket", version_base="1.1")
 def main(cfg):
-    logger = get_logger("train_sae.log")
+    logger = get_logger("train_bucket.log")
     xp = get_xp()
     logger.info(f"Exp signature: {xp.sig}")
-    if not cfg.train.grid_mode:
-        logger.info(repr(cfg))
-        logger.info(f"Work dir: {os.getcwd()}")
+    logger.info(repr(cfg))
+    logger.info(f"Work dir: {os.getcwd()}")
 
     configure_runtime(cfg)
-    if cfg.runtime.device == "cuda" and not torch.cuda.is_available() and not cfg.train.grid_mode:
+    if cfg.runtime.device == "cuda" and not torch.cuda.is_available():
         logger.warning("CUDA requested but unavailable, using CPU.")
     device = torch.device(cfg.runtime.device if torch.cuda.is_available() else "cpu")
     cfg.runtime.device = device.type
 
-    train_dl, eval_dl, dev_dl = initialize_dataloaders(cfg, log=not cfg.train.grid_mode)
-    trainer = SparseAETrainer(cfg, train_dl, eval_dl, dev_dl, logger, xp, device)
+    train_dl, eval_dl, _ = initialize_dataloaders(cfg, logger)
+    trainer = BucketTrainer(cfg, train_dl, eval_dl, logger, xp, device)
 
     if cfg.train.eval_only:
         trainer._load_checkpoint()
-        metrics = trainer.evaluate(eval_dl, desc="SAE Eval")
-        logger.info("Evaluation metrics:\n%s", trainer._metrics_table(metrics))
-        best_dim, f1, precision, recall = trainer.evaluate()
+        best_idx, best_f1, best_p, best_r, table_str = trainer.evaluate()
+        logger.info("Eval-only table:\n%s", table_str)
         logger.info(
-            "Entity dimension=%s",
-            best_dim
+            "Eval-only: best_bucket=%s f1=%.4f precision=%.4f recall=%.4f",
+            best_idx,
+            best_f1,
+            best_p, 
+            best_r,
         )
-        logger.info("Entity metrics:\n%s", trainer._metrics_table({"f1": f1, "precision": precision, "recall": recall}))
     else:
         trainer.train()
 
